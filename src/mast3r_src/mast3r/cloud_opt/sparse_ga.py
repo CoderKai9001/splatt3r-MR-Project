@@ -14,6 +14,8 @@ import os
 from collections import namedtuple
 from functools import lru_cache
 from scipy import sparse as sp
+import copy
+import scipy.cluster.hierarchy as sch
 
 from mast3r.utils.misc import mkdir_for, hash_md5
 from mast3r.cloud_opt.utils.losses import gamma_loss
@@ -53,6 +55,7 @@ class SparseGA():
             self.pts3d_colors.append(im[y, x])
             assert self.pts3d_colors[-1].shape == self.pts3d[i].shape
         self.n_imgs = len(self.imgs)
+        self.anchors = anchors
 
     def get_focals(self):
         return torch.tensor([ff[0, 0] for ff in self.intrinsics]).to(self.working_device)
@@ -115,7 +118,7 @@ def convert_dust3r_pairs_naming(imgs, pairs_in):
 
 
 def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc_conf='desc_conf',
-                            device='cuda', dtype=torch.float32, shared_intrinsics=False, **kw):
+                            kinematic_mode='hclust-ward', device='cuda', dtype=torch.float32, shared_intrinsics=False, **kw):
     """ Sparse alignment with MASt3R
         imgs: list of image paths
         cache_path: path where to dump temporary files (str)
@@ -136,16 +139,53 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
     tmp_pairs, pairwise_scores, canonical_views, canonical_paths, preds_21 = \
         prepare_canonical_data(imgs, pairs, subsample, cache_path=cache_path, mode='avg-angle', device=device)
 
-    # compute minimal spanning tree
-    mst = compute_min_spanning_tree(pairwise_scores)
+    # smartly combine all useful data
+    imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21 = \
+        condense_data(imgs, tmp_pairs, canonical_views, preds_21, dtype)
+
+    # Build kinematic chain
+    if kinematic_mode == 'mst':
+        # compute minimal spanning tree
+        mst = compute_min_spanning_tree(pairwise_scores)
+
+    elif kinematic_mode.startswith('hclust'):
+        mode, linkage = kinematic_mode.split('-')
+
+        # Convert the affinity matrix to a distance matrix (if needed)
+        n_patches = (imsizes // subsample).prod(dim=1)
+        max_n_corres = 3 * torch.minimum(n_patches[:,None], n_patches[None,:])
+        pws = (pairwise_scores.clone() / max_n_corres).clip(max=1)
+        pws.fill_diagonal_(1)
+        pws = to_numpy(pws)
+        distance_matrix = np.where(pws, 1 - pws, 2)
+
+        # Compute the condensed distance matrix
+        condensed_distance_matrix = sch.distance.squareform(distance_matrix)
+
+        # Perform hierarchical clustering using the linkage method
+        Z = sch.linkage(condensed_distance_matrix, method=linkage)
+        # dendrogram = sch.dendrogram(Z)
+
+        tree = np.eye(len(imgs))
+        new_to_old_nodes = {i:i for i in range(len(imgs))}
+        for i, (a, b) in enumerate(Z[:,:2].astype(int)):
+            # given two nodes to be merged, we choose which one is the best representant
+            a = new_to_old_nodes[a]
+            b = new_to_old_nodes[b]
+            tree[a,b] = tree[b,a] = 1
+            best = a if pws[a].sum() > pws[b].sum() else b
+            new_to_old_nodes[len(imgs)+i] = best
+            pws[best] = np.maximum(pws[a], pws[b]) # update the node
+
+        pairwise_scores = torch.from_numpy(tree) # this output just gives 1s for connected edges and zeros for other, i.e. no scores or priority
+        mst = compute_min_spanning_tree(pairwise_scores)
+
+    else:
+        raise ValueError(f'bad {kinematic_mode=}')
 
     # remove all edges not in the spanning tree?
     # min_spanning_tree = {(imgs[i],imgs[j]) for i,j in mst[1]}
     # tmp_pairs = {(a,b):v for (a,b),v in tmp_pairs.items() if {(a,b),(b,a)} & min_spanning_tree}
-
-    # smartly combine all usefull data
-    imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21 = \
-        condense_data(imgs, tmp_pairs, canonical_views, preds_21, dtype)
 
     imgs, res_coarse, res_fine = sparse_scene_optimizer(
         imgs, subsample, imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21, canonical_paths, mst,
@@ -156,8 +196,8 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
 
 def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_depth, anchors, corres, corres2d,
                            preds_21, canonical_paths, mst, cache_path,
-                           lr1=0.2, niter1=500, loss1=gamma_loss(1.1),
-                           lr2=0.02, niter2=500, loss2=gamma_loss(0.4),
+                           lr1=0.07, niter1=300, loss1=gamma_loss(1.5),
+                           lr2=0.01, niter2=300, loss2=gamma_loss(0.5),
                            lossd=gamma_loss(1.1),
                            opt_pp=True, opt_depth=True,
                            schedule=cosine_schedule, depth_mode='add', exp_depth=False,
@@ -166,13 +206,13 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                            init={}, device='cuda', dtype=torch.float32,
                            matching_conf_thr=5., loss_dust3r_w=0.01,
                            verbose=True, dbg=()):
-
+    init = copy.deepcopy(init)
     # extrinsic parameters
     vec0001 = torch.tensor((0, 0, 0, 1), dtype=dtype, device=device)
     quats = [nn.Parameter(vec0001.clone()) for _ in range(len(imgs))]
     trans = [nn.Parameter(torch.zeros(3, device=device, dtype=dtype)) for _ in range(len(imgs))]
 
-    # intialize
+    # initialize
     ones = torch.ones((len(imgs), 1), device=device, dtype=dtype)
     median_depths = torch.ones(len(imgs), device=device, dtype=dtype)
     for img in imgs:
@@ -305,14 +345,6 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     is_matching_ok = {}
     for s in imgs_slices:
         is_matching_ok[s.img1, s.img2] = matching_check(s.confs)
-
-    # Subsample preds_21
-    subsamp_preds_21 = {}
-    for imk, imv in preds_21.items():
-        subsamp_preds_21[imk] = {}
-        for im2k, (pred, conf) in preds_21[imk].items():
-            idxs = anchors[imgs.index(im2k)][1]
-            subsamp_preds_21[imk][im2k] = (pred[idxs], conf[idxs])  # anchors subsample
 
     # Prepare slices and corres for losses
     dust3r_slices = [s for s in imgs_slices if not is_matching_ok[s.img1, s.img2]]
@@ -542,11 +574,14 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
         path_corres = cache_path + f'/corres_conf={desc_conf}_{subsample=}/{idx1}-{idx2}.pth'
         path_corres2 = cache_path + f'/corres_conf={desc_conf}_{subsample=}/{idx2}-{idx1}.pth'
 
+        gaussians_path_1 = cache_path + f'/gaussian_attributes/{idx1}.pth'
+        gaussians_path_2 = cache_path + f'/gaussian_attributes/{idx2}.pth'
+
         if os.path.isfile(path_corres2) and not os.path.isfile(path_corres):
             score, (xy1, xy2, confs) = torch.load(path_corres2)
             torch.save((score, (xy2, xy1, confs)), path_corres)
 
-        if not all(os.path.isfile(p) for p in (path1, path2, path_corres)):
+        if not all(os.path.isfile(p) for p in (path1, path2, path_corres, gaussians_path_1, gaussians_path_2)):
             if model is None:
                 continue
             res = symmetric_inference(model, img1, img2, device=device)
@@ -554,6 +589,22 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
             C11, C21, C22, C12 = [r['conf'][0] for r in res]
             descs = [r['desc'][0] for r in res]
             qonfs = [r[desc_conf][0] for r in res]
+
+            if not os.path.isfile(gaussians_path_1):
+                sh_1 = res[0]['sh']
+                scales_1 = res[0]['scales']
+                rotations_1 = res[0]['rotations']
+                opacities_1 = res[0]['opacities']
+                means_1 = res[0]['means']
+                torch.save(to_cpu((sh_1, scales_1, rotations_1, opacities_1, means_1)), mkdir_for(gaussians_path_1))
+            
+            if not os.path.isfile(gaussians_path_2):
+                sh_2 = res[1]['sh']
+                scales_2 = res[1]['scales']
+                rotations_2 = res[1]['rotations']
+                opacities_2 = res[1]['opacities']
+                means_2 = res[1]['means'] 
+                torch.save(to_cpu((sh_2, scales_2, rotations_2, opacities_2, means_2)), mkdir_for(gaussians_path_2))
 
             # save
             torch.save(to_cpu((X11, C11, X21, C21)), mkdir_for(path1))
@@ -582,13 +633,13 @@ def symmetric_inference(model, img1, img2, device):
     img2 = img2['img'].to(device, non_blocking=True)
 
     # compute encoder only once
-    feat1, feat2, pos1, pos2 = model._encode_image_pairs(img1, img2, shape1, shape2)
+    feat1, feat2, pos1, pos2 = model.encoder._encode_image_pairs(img1, img2, shape1, shape2)
 
     def decoder(feat1, feat2, pos1, pos2, shape1, shape2):
-        dec1, dec2 = model._decoder(feat1, pos1, feat2, pos2)
+        dec1, dec2 = model.encoder._decoder(feat1, pos1, feat2, pos2)
         with torch.cuda.amp.autocast(enabled=False):
-            res1 = model._downstream_head(1, [tok.float() for tok in dec1], shape1)
-            res2 = model._downstream_head(2, [tok.float() for tok in dec2], shape2)
+            res1 = model.encoder._downstream_head(1, [tok.float() for tok in dec1], shape1)
+            res2 = model.encoder._downstream_head(2, [tok.float() for tok in dec2], shape2)
         return res1, res2
 
     # decoder 1-2
@@ -602,9 +653,8 @@ def symmetric_inference(model, img1, img2, device):
 def extract_correspondences(feats, qonfs, subsample=8, device=None, ptmap_key='pred_desc'):
     feat11, feat21, feat22, feat12 = feats
     qonf11, qonf21, qonf22, qonf12 = qonfs
-
-    assert feat11.shape[:2] == feat12.shape[:2] == qonf11.shape == qonf12.shape, (feat11.shape, feat12.shape, qonf11.shape, qonf12.shape)
-    assert feat21.shape[:2] == feat22.shape[:2] == qonf21.shape == qonf22.shape, (feat21.shape, feat22.shape, qonf21.shape, qonf22.shape)
+    assert feat11.shape[:2] == feat12.shape[:2] == qonf11.shape == qonf12.shape
+    assert feat21.shape[:2] == feat22.shape[:2] == qonf21.shape == qonf22.shape
 
     if '3d' in ptmap_key:
         opt = dict(device='cpu', workers=32)
@@ -832,7 +882,8 @@ def canonical_view(ptmaps11, confs11, subsample, mode='avg-angle'):
     canon_depth = ptmaps11[..., 2].unsqueeze(1)
     S = slice(subsample // 2, None, subsample)
     center_depth = canon_depth[:, :, S, S]
-    assert (center_depth > 0).all()
+    center_depth = torch.clip(center_depth, min=torch.finfo(center_depth.dtype).eps)
+
     stacked_depth = F.pixel_unshuffle(canon_depth, subsample)
     stacked_confs = F.pixel_unshuffle(confs11[:, None, :, :, 0], subsample)
 

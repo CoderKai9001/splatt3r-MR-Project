@@ -96,7 +96,7 @@ def save_as_ply(pred1, pred2, save_path):
         return quaternion, scale
 
     # Collect the Gaussian parameters
-    means = torch.stack([pred1["means"], pred2["means_in_other_view"]], dim=1)
+    means = torch.stack([pred1["means"], pred2["means"]], dim=1)
     covariances = torch.stack([pred1["covariances"], pred2["covariances"]], dim=1)
     harmonics = torch.stack([pred1["sh"], pred2["sh"]], dim=1)[..., 0]  # Only use the first harmonic
     opacities = torch.stack([pred1["opacities"], pred2["opacities"]], dim=1)
@@ -132,7 +132,7 @@ def save_3d(view1, view2, pred1, pred2, save_dir, as_pointcloud=True, all_points
 
     for b in range(batch_size):
 
-        pts3d = [pred1["pts3d"][b].cpu().numpy()] + [pred2["pts3d_in_other_view"][b].cpu().numpy()]
+        pts3d = [pred1["pts3d"][b].cpu().numpy()] + [pred2["pts3d"][b].cpu().numpy()]
         imgs = [einops.rearrange(view["original_img"][b], "c h w -> h w c").cpu().numpy() for view in views]
         mask = [view["valid_mask"][b].cpu().numpy() for view in views]
 

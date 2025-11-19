@@ -1,0 +1,4 @@
+pointclouds/
+.vscode/
+msat3r_cache/
+checkpoints/

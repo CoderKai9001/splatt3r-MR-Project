@@ -7,7 +7,7 @@ import lightning as L
 import lpips
 import omegaconf
 import torch
-import wandb
+# import wandb
 
 # Add MAST3R and PixelSplat to the sys.path to prevent issues during importing
 sys.path.append('src/pixelsplat_src')
@@ -105,10 +105,6 @@ class MAST3RGaussians(L.LightningModule):
             new_sh2[..., 0] = sh_utils.RGB2SH(einops.rearrange(view2['original_img'], 'b c h w -> b h w c'))
             pred1['sh'] = pred1['sh'] + new_sh1
             pred2['sh'] = pred2['sh'] + new_sh2
-
-        # Update the keys to make clear that pts3d and means are in view1's frame
-        pred2['pts3d_in_other_view'] = pred2.pop('pts3d')
-        pred2['means_in_other_view'] = pred2.pop('means')
 
         return pred1, pred2
 
