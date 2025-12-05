@@ -18,7 +18,8 @@ from pathlib import Path
 import torchvision.transforms as tfm
 from natsort import natsorted
 from mast3r.image_pairs import make_pairs
-from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
+# from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
+from mast3r.cloud_opt.new_sparse_ga import sparse_global_alignment
 from dust3r.utils.image import load_images
 from huggingface_hub import hf_hub_download
 import utils.geometry as geometry
@@ -215,25 +216,26 @@ class MASt3R:
         gaussian_attributes = {}
 
         for img_idx, img_path, img_hash in image_hashes:
-            gaussians_path = f"{cache_dir}/gaussian_attributes/{img_hash}.pth"
-            
+            # gaussians_path = f"{cache_dir}/gaussian_attributes/{img_hash}.pth"
+            gaussians_path = f"{cache_dir}/canon_gaussians/{img_hash}_subsample=8.pth"
+
             try:
                 # Load the Gaussian attributes for this image
                 gaussians = torch.load(gaussians_path)
-                sh, scales, rotations, opacities, means = gaussians
+                # sh, scales, rotations, opacities, means = gaussians
                 
                 gaussian_attributes[img_idx] = {
                     'image_path': img_path,
                     'hash': img_hash,
-                    'sh': sh,
-                    'scales': scales, 
-                    'rotations': rotations,
-                    'opacities': opacities,
-                    'means': means,
+                    'sh': gaussians['sh'],
+                    'scales': gaussians['scales'], 
+                    'rotations': gaussians['rotations'],
+                    'opacities': gaussians['opacities'],
+                    'means': gaussians['means'],
                     'hash': img_hash
                 }
                 
-                print(f"Loaded Gaussians for image {img_idx}: {sh.shape}")
+                print(f"Loaded Gaussians for image {img_idx}: {gaussians['sh'].shape}")
                 
             except FileNotFoundError:
                 print(f"Gaussian attributes not found for image {img_idx} (hash: {img_hash})")
@@ -293,18 +295,18 @@ class MASt3R:
             means_np = to_np(attr['means'])    # (1, H, W, 3)
 
             # Remove the batch dimension (squeeze first axis)
-            sh_np = sh_np.squeeze(0)          # (H, W, K_sh)
-            scales_np = scales_np.squeeze(0)  # (H, W, 3)
-            rot_np = rot_np.squeeze(0)        # (H, W, 4) or (H, W, 3)
-            op_np = op_np.squeeze(0)          # (H, W, 1) or (H, W)
-            means_np = means_np.squeeze(0)    # (H, W, 3)
+            sh_np = sh_np.squeeze()          # (H, W, K_sh)
+            scales_np = scales_np.squeeze()  # (H, W, 3)
+            rot_np = rot_np.squeeze()        # (H, W, 4) or (H, W, 3)
+            op_np = op_np.squeeze()          # (H, W, 1) or (H, W)
+            means_np = means_np.squeeze()    # (H, W, 3)
 
             # Build covariance map ONCE per image:
             # If build_covariance returns per-pixel HxWx3x3, convert to numpy.
             cov_map = geometry.build_covariance(attr['scales'], attr['rotations'])
             if isinstance(cov_map, torch.Tensor):
                 cov_map = cov_map.detach().cpu().numpy()  # (1, H, W, 3, 3) ideally
-                cov_map = cov_map.squeeze(0)  # Remove batch dimension -> (H, W, 3, 3)
+                cov_map = cov_map.squeeze()  # Remove batch dimension -> (H, W, 3, 3)
 
             # Access the image pixels (scene.imgs likely already numpy or torch)
             img = scene.imgs[img_idx]
@@ -598,7 +600,7 @@ if __name__ == "__main__":
     print("running Mast3r-sfm")
     scene = gen3d.reconstruct_scene(outdir=str(gen3d.outdir),
                                     cache_dir="mast3r_cache",
-                                    scene_graph="complete",
+                                    scene_graph="swin-5-noncyclic",
                                     optim_level="refine+depth",
                                     lr1=0.07, niter1=300,
                                     lr2=0.01, niter2=300)
@@ -620,5 +622,6 @@ if __name__ == "__main__":
             'covariances': coords_to_gaussians_map['covariances'][i]
         }
     
-    gen3d.save_gaussians_as_ply(gaussian_dict, "pointclouds/isitdone.ply")
+    gen3d.save_gaussians_as_ply(gaussian_dict, "pointclouds/canon_averaged.ply")
+    # gen3d.save_pointcloud_with_color(scene, out_ply="pointclouds/pcd_ver.ply")
     print("Saved Splat!\n All Done!!")
