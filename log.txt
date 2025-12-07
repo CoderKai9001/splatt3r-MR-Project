@@ -1,5 +1,0 @@
-Splat generation started at 2025-12-07 18:01:48.324722
-Total datasets to process: 1
-
-[2025-12-07 18:01:48.325593] Starting dataset 1/1: apple
-[2025-12-07 18:04:29.456857] All datasets processed. Script completed.
