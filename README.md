@@ -2,6 +2,41 @@
 
 extending splatt3r to n views using mast3r-sfm framework
 
+### Gallery
+<details>
+  <summary>Co3D Apple</summary>
+
+  ![Preview](assets/apple.png)
+
+</details>
+
+<details>
+  <summary>Co3D Bench</summary>
+
+  ![Preview](assets/bench.png)
+
+</details>
+
+<details>
+  <summary>Co3D Book</summary>
+
+  ![Preview](assets/book.png)
+
+</details>
+
+<details>
+  <summary>Co3D Teddy Bear</summary>
+
+  ![Preview](assets/teddy.png)
+
+</details>
+
+<details>
+  <summary>RRC IITH, a small run with sparse images</summary>
+
+  ![Preview](assets/labrun.jpg)
+
+</details>
 ### Setup:
 
 setup the environment
