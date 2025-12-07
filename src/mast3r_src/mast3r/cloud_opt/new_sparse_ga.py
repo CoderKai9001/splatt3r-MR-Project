@@ -813,7 +813,7 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
             torch.save(to_cpu((X22, C22, X12, C12)), mkdir_for(path2))
             
             # NEW: Save Gaussian attributes
-            print(f"[SAVE] For pair ({img1['instance']}, {img2['instance']}) → saving g11,g21 → {gaussians_path1}")
+            # print(f"[SAVE] For pair ({img1['instance']}, {img2['instance']}) → saving g11,g21 → {gaussians_path1}")
             # path1 corresponds to (img1, img2) pair viewed from img1
             gaussian_data1 = {
                 'g1': to_cpu(g11),  # img1's Gaussians in img1's frame
@@ -821,7 +821,7 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
             }
             torch.save(gaussian_data1, mkdir_for(gaussians_path1))
             
-            print(f"[SAVE] For pair ({img2['instance']}, {img1['instance']}) → saving g22,g12 → {gaussians_path2}")
+            # print(f"[SAVE] For pair ({img2['instance']}, {img1['instance']}) → saving g22,g12 → {gaussians_path2}")
             # path2 corresponds to (img2, img1) pair viewed from img2
             gaussian_data2 = {
                 'g1': to_cpu(g22),  # img2's Gaussians in img2's frame
@@ -1269,7 +1269,7 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
         canonical_views[img] = (pp, (H, W), focal.view(1), core_depth, pixels, idxs, offsets)
         canonical_gaussians[img] = avg_gaussians
         assert avg_gaussians is not None, f"avg_gaussians is None for image {img}"
-        print(f"[INFO] Processed canonical data for image: {img} and avg_gaussians keys: {list(avg_gaussians.keys())}")
+        # print(f"[INFO] Processed canonical data for image: {img} and avg_gaussians keys: {list(avg_gaussians.keys())}")
 
     return tmp_pairs, pairwise_scores, canonical_views, canonical_gaussians, canonical_paths, preds_21
 

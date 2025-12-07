@@ -27,16 +27,22 @@ from main import MAST3RGaussians
 from src.mast3r_src.demo import get_3D_model_from_scene
 from plyfile import PlyData, PlyElement
 from scipy.spatial.transform import Rotation
+from select_frames import select_frames
+import argparse
+import datetime
 
 class MASt3R:
-    def __init__(self, imgdir, outdir):
+    def __init__(self, imgdir, outdir, sample_images=True, stride=5):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.H=512
         self.W=512
         self.imgdir = imgdir
         self.outdir = outdir
-        self.imgNames = natsorted(os.listdir(f'{imgdir}'))
-        self.imgNames = [f'{imgdir}/{imgName}' for imgName in self.imgNames]
+        if sample_images:
+            self.imgNames = select_frames(imgdir, stride=stride)
+        else:
+            self.imgNames = natsorted(os.listdir(f'{imgdir}'))
+            self.imgNames = [f'{imgdir}/{imgName}' for imgName in self.imgNames]
         self.npzFullPath = f"{outdir}/nodes_mast3r_points.npz"
         self.normalize = tfm.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         # self.model_path = Path("checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth")
@@ -203,7 +209,7 @@ class MASt3R:
                                         **kw)
         return scene
     
-    def retrieve_gaussians(self, scene, cache_dir="mast3r_cache"):
+    def retrieve_gaussians(self, scene, cache_dir="/scratch/mast3r_cache"):
         """
         Get Gaussian Attributes from cache dir
         """
@@ -234,6 +240,17 @@ class MASt3R:
                     'means': gaussians['means'],
                     'hash': img_hash
                 }
+
+                # gaussian_attributes[img_idx] = {
+                #     'image_path': img_path,
+                #     'hash': img_hash,
+                #     'sh': sh,
+                #     'scales': scales, 
+                #     'rotations': rotations,
+                #     'opacities': opacities,
+                #     'means': means,
+                #     'hash': img_hash
+                # }
                 
                 print(f"Loaded Gaussians for image {img_idx}: {gaussians['sh'].shape}")
                 
@@ -242,24 +259,38 @@ class MASt3R:
 
         return gaussian_attributes
 
-    def get_pts_to_gaussian_map(self, scene, gaussian_attributes):
+    def get_pts_to_gaussian_map(self, scene, gaussian_attributes, 
+                                threshold_mode="percentile", 
+                                percentile_value=50.0, 
+                                min_conf_threshold=1.5):
         """
         Memory-safe build of Gaussian attributes for all dense pts3d in scene.
-        Returns a dict of numpy arrays:
-        {
-            'pts3d': (N,3),
-            'pixels': (N,2),   # x,y
-            'image_index': (N,),
-            'color': (N,3),
-            'sh': (N, K_sh),
-            'scales': (N,3),
-            'rotations': (N,4) or (N,3) depending on source,
-            'opacities': (N,1),
-            'means': (N,3),
-            'covariances': (N,3,3)  # or (N,9) flattened
-        }
+        
+        Args:
+            scene: The reconstructed scene
+            gaussian_attributes: Dictionary of Gaussian attributes per image
+            threshold_mode: "percentile" or "threshold"
+            percentile_value: Percentile value (0-100) for confidence filtering when mode="percentile"
+            min_conf_threshold: Fixed confidence threshold when mode="threshold"
         """
-        pts3d_dense, _, _ = scene.get_dense_pts3d(clean_depth=True)
+        pts3d_dense, _, confs = scene.get_dense_pts3d(clean_depth=True)
+
+        from dust3r.utils.device import to_numpy
+        confs_np = to_numpy(confs)
+        
+        # Calculate confidence threshold based on selected mode
+        if threshold_mode == "percentile":
+            all_confs = np.concatenate([c.ravel() for c in confs_np])
+            min_conf_thr = np.percentile(all_confs, percentile_value)
+            print(f"Using {percentile_value}th percentile confidence threshold: {min_conf_thr:.3f}")
+        elif threshold_mode == "threshold":
+            min_conf_thr = min_conf_threshold
+            print(f"Using hardcoded confidence threshold: {min_conf_thr:.3f}")
+        else:
+            raise ValueError(f"Invalid threshold_mode: {threshold_mode}. Must be 'percentile' or 'threshold'")
+        
+        # Create confidence masks for each image
+        conf_masks = [c >= min_conf_thr for c in confs_np]
 
         # Lists to collect final attributes
         pts3d_list = []
@@ -274,7 +305,7 @@ class MASt3R:
         cov_list = []
 
         # Iterate per image and process entire attribute tensors once
-        for img_idx, pts3d_img in enumerate(tqdm(pts3d_dense, desc="Processing images", unit="img")):
+        for img_idx, (pts3d_img, conf_mask) in enumerate(tqdm(zip(pts3d_dense, conf_masks), desc="Processing images", unit="img")):
             # Convert gaussian attributes for this image to CPU numpy ONCE
             if img_idx not in gaussian_attributes:
                 # skip if attributes missing
@@ -282,7 +313,6 @@ class MASt3R:
             attr = gaussian_attributes[img_idx]
 
             # Convert full tensors to numpy on CPU once
-            # Handle both torch.Tensor and numpy already
             def to_np(x):
                 if isinstance(x, torch.Tensor):
                     return x.detach().cpu().numpy()
@@ -301,14 +331,13 @@ class MASt3R:
             op_np = op_np.squeeze()          # (H, W, 1) or (H, W)
             means_np = means_np.squeeze()    # (H, W, 3)
 
-            # Build covariance map ONCE per image:
-            # If build_covariance returns per-pixel HxWx3x3, convert to numpy.
+            # Build covariance map ONCE per image
             cov_map = geometry.build_covariance(attr['scales'], attr['rotations'])
             if isinstance(cov_map, torch.Tensor):
                 cov_map = cov_map.detach().cpu().numpy()  # (1, H, W, 3, 3) ideally
                 cov_map = cov_map.squeeze()  # Remove batch dimension -> (H, W, 3, 3)
 
-            # Access the image pixels (scene.imgs likely already numpy or torch)
+            # Access the image pixels
             img = scene.imgs[img_idx]
             if isinstance(img, torch.Tensor):
                 img_np = img.detach().cpu().numpy()
@@ -317,14 +346,24 @@ class MASt3R:
 
             H = self.H
             W = self.W
-            # safe-check shapes: if sh/scales dims have extra leading dims, squeeze appropriately
-            # We'll index as [y, x, ...] so ensure shapes are (H, W, ...)
-            # Now iterate pixels (only where there is a dense point)
+            
+            # Reshape confidence mask to match spatial dimensions
+            if conf_mask.ndim == 2:
+                conf_mask_2d = conf_mask
+            else:
+                conf_mask_2d = conf_mask.reshape(H, W)
+
+            # Now iterate pixels (only where there is a dense point AND high confidence)
             for y in range(H):
                 for x in range(W):
                     linear_idx = y * W + x
                     if linear_idx >= len(pts3d_img):
                         continue
+                        
+                    # Apply confidence thresholding - skip low confidence points
+                    if not conf_mask_2d[y, x]:
+                        continue
+                        
                     pt3d = pts3d_img[linear_idx]
                     # Convert pt3d to numpy once per point
                     if isinstance(pt3d, torch.Tensor):
@@ -359,6 +398,8 @@ class MASt3R:
                     cov_px = cov_map[y, x] if cov_map is not None else np.eye(3, dtype=np.float32)
                     cov_list.append(np.asarray(cov_px).astype(np.float32))
 
+            print(f"Image {img_idx}: {len([p for p in conf_mask_2d.ravel() if p])} high-confidence points out of {len(conf_mask_2d.ravel())} total")
+
         # Stack lists into arrays
         pts3d_arr = np.stack(pts3d_list, axis=0) if pts3d_list else np.zeros((0,3), dtype=np.float32)
         pixels_arr = np.array(pixels_list, dtype=np.int32) if pixels_list else np.zeros((0,2), dtype=np.int32)
@@ -383,14 +424,16 @@ class MASt3R:
             'means': means_arr,
             'covariances': cov_arr
         }
-        print(f"Created mapping for {pts3d_arr.shape[0]} Gaussian points")
+        print(f"Created mapping for {pts3d_arr.shape[0]} high-confidence Gaussians (threshold: {min_conf_thr:.3f})")
         return out
 
-
-    def save_gaussians_as_ply(self, coords_to_gaussians_map, save_path):
+    def save_gaussians_as_ply(self, coords_to_gaussians_map, save_path, min_opacity=0.05, max_scale=10.0, 
+                            remove_top_volume_percentile=0.1, confidence_filter=True):
         """
-        Fully safe version – no .detach() on NumPy, no GPU tensors left,
-        converts everything to NumPy before building the PLY array.
+        Enhanced version with confidence-based filtering plus existing noise filters.
+        
+        Added Parameters:
+        - confidence_filter: Whether to apply additional confidence-based filtering (already done in get_pts_to_gaussian_map)
         """
         import numpy as np
         from plyfile import PlyData, PlyElement
@@ -468,6 +511,8 @@ class MASt3R:
         opacities = np.array(opacities_list).reshape(-1, 1)
         covs = np.array(covs_list).reshape(-1, 3, 3)
 
+        print(f"Starting with {len(means)} Gaussians (already confidence-filtered)")
+
         # --------------------------------------------
         # 2. Convert colors → SH0
         # --------------------------------------------
@@ -478,7 +523,45 @@ class MASt3R:
         # --------------------------------------------
         print("Converting covariance → quaternion + scale...")
         quats, scales = covariance_to_quat_and_scale(covs)
-        scales = np.log(scales)
+
+        # --------------------------------------------
+        # 3.5 Filter Noisy Gaussians (additional to confidence filtering)
+        # --------------------------------------------
+        print(f"Filtering: min_opacity={min_opacity}, max_scale={max_scale}")
+        
+        # 1. Opacity Filter (remove faint points)
+        mask_op = (opacities.flatten() >= min_opacity)
+
+        # 2. Scale Filter (remove huge floaters based on absolute size)
+        mask_scale = (scales.max(axis=1) <= max_scale)
+
+        # 3. Volume Percentile Filter (remove relatively large floaters)
+        mask_vol = np.ones(scales.shape[0], dtype=bool)
+        if remove_top_volume_percentile > 0:
+            volumes = np.prod(scales, axis=1)
+            cutoff = np.percentile(volumes, (1.0 - remove_top_volume_percentile) * 100)
+            mask_vol = (volumes <= cutoff)
+            print(f"Volume Filter: Removing top {remove_top_volume_percentile*100}% (volume > {cutoff:.5f})")
+
+        # 4. NaN Safety Filter
+        mask_nan = ~np.isnan(means).any(axis=1) & ~np.isnan(scales).any(axis=1)
+
+        # Combine masks
+        valid_mask = mask_op & mask_scale & mask_vol & mask_nan
+
+        n_before = len(means)
+        means = means[valid_mask]
+        sh_dc = sh_dc[valid_mask]
+        opacities = opacities[valid_mask]
+        scales = scales[valid_mask]
+        quats = quats[valid_mask]
+        n_after = len(means)
+        
+        print(f"Additional filtering removed {n_before - n_after} noisy Gaussians. Final count: {n_after}")
+
+        # Apply log to scales for PLY format (standard 3DGS convention)
+        scales = np.log(np.maximum(scales, 1e-8))
+
         # --------------------------------------------
         # 4. Build the structured array
         # --------------------------------------------
@@ -505,7 +588,8 @@ class MASt3R:
         print(f"Saving PLY to: {save_path}")
         vertex_el = PlyElement.describe(elements, "vertex")
         PlyData([vertex_el]).write(save_path)
-        print(f"✓ Saved {N} Gaussians to {save_path}")
+        print(f"✓ Saved {N} high-confidence Gaussians to {save_path}")
+
 
 
     def save_pointcloud_with_color(self, scene, out_ply: Union[str, Path]):
@@ -594,34 +678,108 @@ class MASt3R:
         return out_ply
 
 if __name__ == "__main__":
-    gen3d = MASt3R(imgdir=Path("./images"), outdir=Path("./pointclouds"))
+    parser = argparse.ArgumentParser(description='MASt3R 3D Gaussian Splatting Pipeline')
+    parser.add_argument('--images_path', type=str, required=True,
+                       help='Path to directory containing input images')
+    parser.add_argument('--output_dir', type=str, required=True,
+                       help='Output directory for results')
+    parser.add_argument('--threshold_mode', type=str, choices=['percentile', 'threshold'], 
+                       default='percentile',
+                       help='Confidence threshold mode: "percentile" or "threshold"')
+    parser.add_argument('--percentile_value', type=float, default=75.0,
+                       help='Percentile value (0-100) for confidence filtering when using percentile mode')
+    parser.add_argument('--min_conf_threshold', type=float, default=1.5,
+                       help='Fixed confidence threshold when using threshold mode')
+    parser.add_argument('--top_volume_percentile', type=float, default=0.1,
+                       help='Remove top volume percentile to filter out large floaters (0.0-1.0)')
+    parser.add_argument('--stride', type=int, default=None,
+                       help='Stride for frame sampling. If not specified, all images will be used')
+    parser.add_argument('--enable_logging', action='store_true',
+                       help='Enable logging to log.txt file')
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.threshold_mode == 'percentile' and (args.percentile_value < 0 or args.percentile_value > 100):
+        parser.error("percentile_value must be between 0 and 100")
+    if args.top_volume_percentile < 0 or args.top_volume_percentile > 1:
+        parser.error("top_volume_percentile must be between 0.0 and 1.0")
 
-    # run multi-view Mast3R SfM
-    print("running Mast3r-sfm")
-    scene = gen3d.reconstruct_scene(outdir=str(gen3d.outdir),
-                                    cache_dir="mast3r_cache",
-                                    scene_graph="swin-5-noncyclic",
-                                    optim_level="refine+depth",
-                                    lr1=0.07, niter1=300,
-                                    lr2=0.01, niter2=300)
-    
-    print("SFM Done!")
+    # Initialize log file if enabled
+    if args.enable_logging:
+        with open("log.txt", "w") as log_file:
+            log_file.write(f"Starting MASt3R pipeline at {datetime.datetime.now()}\n")
 
-    gaussian_attributes = gen3d.retrieve_gaussians(scene, cache_dir="mast3r_cache")
-    print("Retrieved Gaussian attrs from cache\nGetting 3dpts to gaussians map")
-    coords_to_gaussians_map = gen3d.get_pts_to_gaussian_map(scene, gaussian_attributes)
-    print("map obtained!\nSaving final splat")
+    input_dir = args.images_path
+    output_dir = args.output_dir
     
-    # Convert the data format to what save_gaussians_as_ply expects
-    gaussian_dict = {}
-    for i in range(len(coords_to_gaussians_map['pts3d'])):
-        gaussian_dict[i] = {
-            'pt_3d': coords_to_gaussians_map['pts3d'][i],
-            'color': coords_to_gaussians_map['color'][i], 
-            'opacities': coords_to_gaussians_map['opacities'][i],
-            'covariances': coords_to_gaussians_map['covariances'][i]
-        }
+    try:
+        # Initialize MASt3R
+        sample_images = args.stride is not None
+        stride = args.stride if args.stride is not None else 5
+        gen3d = MASt3R(input_dir, output_dir, sample_images=sample_images, stride=stride)
+        
+        # Reconstruct scene
+        scene = gen3d.reconstruct_scene(
+            outdir=output_dir,
+            cache_dir="/scratch/mast3r_cache",
+            scene_graph="complete",
+            optim_level="refine+depth",
+            shared_intrinsics=True
+        )
+        
+        # Retrieve Gaussian attributes
+        gaussian_attributes = gen3d.retrieve_gaussians(scene, cache_dir="/scratch/mast3r_cache")
+        print("Retrieved Gaussian attrs from cache\nGetting 3dpts to gaussians map")
+        
+        # Get point to Gaussian mapping with specified threshold mode
+        coords_to_gaussians_map = gen3d.get_pts_to_gaussian_map(
+            scene, gaussian_attributes, 
+            threshold_mode=args.threshold_mode, 
+            percentile_value=args.percentile_value,
+            min_conf_threshold=args.min_conf_threshold
+        )
+        
+        print("map obtained!\nSaving final splat")
+        
+        # Convert the data format to what save_gaussians_as_ply expects
+        gaussian_dict = {}
+        for i in range(len(coords_to_gaussians_map['pts3d'])):
+            gaussian_dict[i] = {
+                'pt_3d': coords_to_gaussians_map['pts3d'][i],
+                'color': coords_to_gaussians_map['color'][i], 
+                'opacities': coords_to_gaussians_map['opacities'][i],
+                'covariances': coords_to_gaussians_map['covariances'][i]
+            }
+        
+        # Save Gaussians as PLY
+        output_splat_path = f"{output_dir}/final_splat.ply"
+        gen3d.save_gaussians_as_ply(
+            gaussian_dict, 
+            output_splat_path,
+            remove_top_volume_percentile=args.top_volume_percentile
+        )
+        
+        # Save point cloud with color
+        output_pc_path = f"{output_dir}/pointcloud_colored.ply"
+        gen3d.save_pointcloud_with_color(scene, output_pc_path)
+        
+        if args.enable_logging:
+            with open("log.txt", "a") as log_file:
+                log_file.write(f"Successfully processed {input_dir}\n")
+                log_file.write(f"Output saved to {output_dir}\n")
+        
+        print(f"Processing completed successfully!")
+        print(f"Results saved to: {output_dir}")
+        
+    except Exception as e:
+        error_msg = f"Error processing {input_dir}: {str(e)}"
+        print(error_msg)
+        if args.enable_logging:
+            with open("log.txt", "a") as log_file:
+                log_file.write(f"{error_msg}\n")
     
-    gen3d.save_gaussians_as_ply(gaussian_dict, "pointclouds/canon_averaged.ply")
-    # gen3d.save_pointcloud_with_color(scene, out_ply="pointclouds/pcd_ver.ply")
-    print("Saved Splat!\n All Done!!")
+    # Log completion
+    if args.enable_logging:
+        with open("log.txt", "a") as log_file:
+            log_file.write(f"Pipeline completed at {datetime.datetime.now()}\n")
