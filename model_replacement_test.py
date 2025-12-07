@@ -775,7 +775,7 @@ if __name__ == "__main__":
         scene = gen3d.reconstruct_scene(
             outdir=output_dir,
             cache_dir="/scratch/mast3r_cache",
-            scene_graph="complete",
+            scene_graph="swin-5-noncyclic",
             optim_level="refine+depth",
             shared_intrinsics=True
         )
