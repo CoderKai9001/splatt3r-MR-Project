@@ -211,6 +211,9 @@ class MASt3R:
     
     def retrieve_gaussians(self, scene, cache_dir="/scratch/mast3r_cache"):
         """
+        Retrieves gaussian attributes from cache or generates them if not cached.
+        """
+        """
         Get Gaussian Attributes from cache dir
         """
         image_hashes = []
@@ -259,6 +262,49 @@ class MASt3R:
 
         return gaussian_attributes
 
+    def _rosin_triangle_threshold(self, data):
+        """
+        Implements Rosin's triangle method for automatic threshold selection.
+        This method finds the threshold that maximizes the distance from the line
+        connecting the histogram peak to the tail.
+        """
+        # Create histogram
+        hist, bin_edges = np.histogram(data, bins=100)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        
+        # Find the peak of the histogram
+        peak_idx = np.argmax(hist)
+        peak_x, peak_y = bin_centers[peak_idx], hist[peak_idx]
+        
+        # Find the rightmost point (tail)
+        tail_idx = len(hist) - 1
+        # Find the last non-zero bin or use the rightmost bin
+        while tail_idx > peak_idx and hist[tail_idx] == 0:
+            tail_idx -= 1
+        tail_x, tail_y = bin_centers[tail_idx], hist[tail_idx]
+        
+        # Calculate perpendicular distance from each point to the line connecting peak and tail
+        max_distance = 0
+        threshold_idx = peak_idx
+        
+        for i in range(peak_idx, tail_idx + 1):
+            x, y = bin_centers[i], hist[i]
+            
+            # Calculate distance from point (x,y) to line from (peak_x,peak_y) to (tail_x,tail_y)
+            # Using formula: |ax + by + c| / sqrt(a^2 + b^2)
+            # Line equation: (tail_y - peak_y)x - (tail_x - peak_x)y + (tail_x * peak_y - peak_x * tail_y) = 0
+            a = tail_y - peak_y
+            b = -(tail_x - peak_x)
+            c = tail_x * peak_y - peak_x * tail_y
+            
+            distance = abs(a * x + b * y + c) / np.sqrt(a**2 + b**2)
+            
+            if distance > max_distance:
+                max_distance = distance
+                threshold_idx = i
+        
+        return bin_centers[threshold_idx]
+
     def get_pts_to_gaussian_map(self, scene, gaussian_attributes, 
                                 threshold_mode="percentile", 
                                 percentile_value=50.0, 
@@ -286,8 +332,12 @@ class MASt3R:
         elif threshold_mode == "threshold":
             min_conf_thr = min_conf_threshold
             print(f"Using hardcoded confidence threshold: {min_conf_thr:.3f}")
+        elif threshold_mode == "triangle":
+            all_confs = np.concatenate([c.ravel() for c in confs_np])
+            min_conf_thr = self._rosin_triangle_threshold(all_confs)
+            print(f"Using Triangle method (Rosin) confidence threshold: {min_conf_thr:.3f}")
         else:
-            raise ValueError(f"Invalid threshold_mode: {threshold_mode}. Must be 'percentile' or 'threshold'")
+            raise ValueError(f"Invalid threshold_mode: {threshold_mode}. Must be 'percentile', 'threshold', or 'triangle'")
         
         # Create confidence masks for each image
         conf_masks = [c >= min_conf_thr for c in confs_np]
@@ -683,9 +733,9 @@ if __name__ == "__main__":
                        help='Path to directory containing input images')
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Output directory for results')
-    parser.add_argument('--threshold_mode', type=str, choices=['percentile', 'threshold'], 
+    parser.add_argument('--threshold_mode', type=str, choices=['percentile', 'threshold', 'triangle'], 
                        default='percentile',
-                       help='Confidence threshold mode: "percentile" or "threshold"')
+                       help='Confidence threshold mode: "percentile", "threshold", or "triangle" (Rosin method)')
     parser.add_argument('--percentile_value', type=float, default=75.0,
                        help='Percentile value (0-100) for confidence filtering when using percentile mode')
     parser.add_argument('--min_conf_threshold', type=float, default=1.5,
@@ -694,6 +744,8 @@ if __name__ == "__main__":
                        help='Remove top volume percentile to filter out large floaters (0.0-1.0)')
     parser.add_argument('--stride', type=int, default=None,
                        help='Stride for frame sampling. If not specified, all images will be used')
+    parser.add_argument('--output_filename', type=str, default='final_splat.ply',
+                       help='Name of the output PLY file (default: final_splat.ply)')
     parser.add_argument('--enable_logging', action='store_true',
                        help='Enable logging to log.txt file')
     
@@ -753,7 +805,7 @@ if __name__ == "__main__":
             }
         
         # Save Gaussians as PLY
-        output_splat_path = f"{output_dir}/final_splat.ply"
+        output_splat_path = f"{output_dir}/{args.output_filename}"
         gen3d.save_gaussians_as_ply(
             gaussian_dict, 
             output_splat_path,
