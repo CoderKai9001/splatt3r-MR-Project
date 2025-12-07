@@ -147,5 +147,12 @@ python model_replacement_test.py \
     booktitle={International Conference on 3D Vision 2025},
     year={2025},
     url={https://openreview.net/forum?id=5uw1GRBFoT}
-} 
+}
+
+@inproceedings{reizenstein21co3d,
+	Author = {Reizenstein, Jeremy and Shapovalov, Roman and Henzler, Philipp and Sbordone, Luca and Labatut, Patrick and Novotny, David},
+	Booktitle = {International Conference on Computer Vision},
+	Title = {Common Objects in 3D: Large-Scale Learning and Evaluation of Real-life 3D Category Reconstruction},
+	Year = {2021},
+}
 ```
